@@ -207,13 +207,12 @@ def render_incam(cfg):
         return
 
     pred = torch.load(cfg.paths.hmr4d_results)
-    smplx = make_smplx("supermotion").cuda()
-    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
-    faces_smpl = make_smplx("smpl").faces
+    smplx = make_smplx("supermotion_fullhands").cuda()
+    faces_smplx = smplx.faces
 
-    # smpl
+    # SMPLX
     smplx_out = smplx(**to_cuda(pred["smpl_params_incam"]))
-    pred_c_verts = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in smplx_out.vertices])
+    verts_incam = smplx_out.vertices
 
     # -- rendering code -- #
     video_path = cfg.video_path
@@ -221,12 +220,11 @@ def render_incam(cfg):
     K = pred["K_fullimg"][0]
 
     # renderer
-    renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K)
+    renderer = Renderer(width, height, device="cuda", faces=faces_smplx, K=K)
     reader = get_video_reader(video_path)  # (F, H, W, 3), uint8, numpy
     bbx_xys_render = torch.load(cfg.paths.bbx)["bbx_xys"]
 
     # -- render mesh -- #
-    verts_incam = pred_c_verts
     writer = get_writer(incam_video_path, fps=30, crf=CRF)
     for i, img_raw in tqdm(enumerate(reader), total=get_video_lwh(video_path)[0], desc=f"Rendering Incam"):
         img = renderer.render_mesh(verts_incam[i].cuda(), img_raw, [0.8, 0.8, 0.8])
@@ -250,14 +248,13 @@ def render_global(cfg):
 
     debug_cam = False
     pred = torch.load(cfg.paths.hmr4d_results)
-    smplx = make_smplx("supermotion").cuda()
-    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
-    faces_smpl = make_smplx("smpl").faces
+    smplx = make_smplx("supermotion_fullhands").cuda()
+    faces_smplx = smplx.faces
     J_regressor = torch.load("hmr4d/utils/body_model/smpl_neutral_J_regressor.pt").cuda()
 
-    # smpl
+    # SMPLX
     smplx_out = smplx(**to_cuda(pred["smpl_params_global"]))
-    pred_ay_verts = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in smplx_out.vertices])
+    pred_ay_verts = smplx_out.vertices
 
     def move_to_start_point_face_z(verts):
         "XZ to origin, Start from the ground, Face-Z"
@@ -286,8 +283,8 @@ def render_global(cfg):
     _, _, K = create_camera_sensor(width, height, 24)  # render as 24mm lens
 
     # renderer
-    renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K)
-    # renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K, bin_size=0)
+    renderer = Renderer(width, height, device="cuda", faces=faces_smplx, K=K)
+    # renderer = Renderer(width, height, device="cuda", faces=faces_smplx, K=K, bin_size=0)
 
     # -- render mesh -- #
     scale, cx, cz = get_ground_params_from_points(joints_glob[:, 0], verts_glob)
