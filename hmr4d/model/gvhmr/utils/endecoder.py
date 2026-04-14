@@ -182,6 +182,14 @@ class EnDecoder(nn.Module):
             "local_transl_vel": local_transl_vel,
         }
 
+        # Add default SMPL-X hand/face pose outputs so GVHMR can produce full SMPL-X parameters.
+        hand_dim = getattr(self.smplx_model, "hand_pose_dim", 45)
+        output["left_hand_pose"] = torch.zeros((B, L, hand_dim), device=x.device, dtype=x.dtype)
+        output["right_hand_pose"] = torch.zeros((B, L, hand_dim), device=x.device, dtype=x.dtype)
+        output["jaw_pose"] = torch.zeros((B, L, 3), device=x.device, dtype=x.dtype)
+        output["leye_pose"] = torch.zeros((B, L, 3), device=x.device, dtype=x.dtype)
+        output["reye_pose"] = torch.zeros((B, L, 3), device=x.device, dtype=x.dtype)
+
         return output
 
 
