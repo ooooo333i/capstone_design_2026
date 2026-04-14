@@ -38,10 +38,10 @@ def make_smplx(type="neu_fullpose", **kwargs):
             "flat_hand_mean": False,
             "create_left_hand_pose": True,
             "create_right_hand_pose": True,
-            "create_expression": False,
-            "create_jaw_pose": False,
-            "create_leye_pose": False,
-            "create_reye_pose": False,
+            "create_expression": True,
+            "create_jaw_pose": True,
+            "create_leye_pose": True,
+            "create_reye_pose": True,
         }
         bm_kwargs.update(kwargs)
         model = smplx.create(model_path=PROJ_ROOT / "inputs/checkpoints/body_models", **bm_kwargs)
