@@ -63,12 +63,15 @@ class EnDecoder(nn.Module):
         body_pose_r6d = (body_pose_r6d - self.mean[:126]) / self.std[:126]  # (B, L, C)
         return body_pose_r6d
 
-    def fk_v2(self, body_pose, betas, global_orient=None, transl=None, get_intermediate=False):
+    def fk_v2(self, body_pose, betas, global_orient=None, transl=None, get_intermediate=False, **kwargs):
         """
         Args:
             body_pose: (B, L, 63)
             betas: (B, L, 10)
             global_orient: (B, L, 3)
+            **kwargs: Additional SMPL-X parameters such as left_hand_pose, right_hand_pose,
+                jaw_pose, leye_pose, and reye_pose. These are accepted for compatibility but
+                ignored by this legacy FK implementation.
         Returns:
             joints: (B, L, 22, 3)
         """
