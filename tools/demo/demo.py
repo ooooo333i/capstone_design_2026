@@ -200,6 +200,22 @@ def load_data_dict(cfg):
     return data
 
 
+def filter_smplx_params(params):
+    allowed = {
+        "betas",
+        "body_pose",
+        "global_orient",
+        "transl",
+        "left_hand_pose",
+        "right_hand_pose",
+        "jaw_pose",
+        "leye_pose",
+        "reye_pose",
+        "expression",
+    }
+    return {k: v for k, v in params.items() if k in allowed}
+
+
 def render_incam(cfg):
     incam_video_path = Path(cfg.paths.incam_video)
     if incam_video_path.exists():
@@ -211,7 +227,7 @@ def render_incam(cfg):
     faces_smplx = smplx.faces
 
     # SMPLX
-    smplx_out = smplx(**to_cuda(pred["smpl_params_incam"]))
+    smplx_out = smplx(**to_cuda(filter_smplx_params(pred["smpl_params_incam"])))
     verts_incam = smplx_out.vertices
 
     # -- rendering code -- #
@@ -253,7 +269,7 @@ def render_global(cfg):
     J_regressor = torch.load("hmr4d/utils/body_model/smpl_neutral_J_regressor.pt").cuda()
 
     # SMPLX
-    smplx_out = smplx(**to_cuda(pred["smpl_params_global"]))
+    smplx_out = smplx(**to_cuda(filter_smplx_params(pred["smpl_params_global"])))
     pred_ay_verts = smplx_out.vertices
 
     def move_to_start_point_face_z(verts):
