@@ -1,11 +1,6 @@
 import torch
 from typing import Any
 
-from .renderer import Renderer
-from .mesh_renderer import MeshRenderer
-from .skeleton_renderer import SkeletonRenderer
-from .pose_utils import eval_pose, Evaluator
-
 def recursive_to(x: Any, target: torch.device):
     """
     Recursively transfer a batch of data to the target device
@@ -23,3 +18,23 @@ def recursive_to(x: Any, target: torch.device):
         return [recursive_to(i, target) for i in x]
     else:
         return x
+
+
+def __getattr__(name: str):
+    if name == "Renderer":
+        from .renderer import Renderer
+
+        return Renderer
+    if name == "MeshRenderer":
+        from .mesh_renderer import MeshRenderer
+
+        return MeshRenderer
+    if name == "SkeletonRenderer":
+        from .skeleton_renderer import SkeletonRenderer
+
+        return SkeletonRenderer
+    if name in {"eval_pose", "Evaluator"}:
+        from .pose_utils import Evaluator, eval_pose
+
+        return {"eval_pose": eval_pose, "Evaluator": Evaluator}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

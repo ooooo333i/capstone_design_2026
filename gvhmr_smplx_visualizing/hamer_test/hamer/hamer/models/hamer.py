@@ -4,7 +4,6 @@ from typing import Any, Dict, Mapping, Tuple
 
 from yacs.config import CfgNode
 
-from ..utils import SkeletonRenderer, MeshRenderer
 from ..utils.geometry import aa_to_rotmat, perspective_projection
 from ..utils.pylogger import get_pylogger
 from .backbones import create_backbone
@@ -47,14 +46,24 @@ class HAMER(pl.LightningModule):
         self.keypoint_2d_loss = Keypoint2DLoss(loss_type='l1')
         self.mano_parameter_loss = ParameterLoss()
 
-        # Instantiate MANO model
+        # Instantiate MANO model. CAP inference only needs pred_mano_params, so
+        # missing licensed MANO mesh files should not block hand-pose export.
         mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
-        self.mano = MANO(**mano_cfg)
+        try:
+            self.mano = MANO(**mano_cfg)
+        except Exception as e:
+            if init_renderer:
+                raise
+            print(f"[HaMeR] Warning: MANO layer unavailable; exporting hand pose without vertices/joints: {e}")
+            self.mano = None
 
         # Buffer that shows whetheer we need to initialize ActNorm layers
         self.register_buffer('initialized', torch.tensor(False))
         # Setup renderer for visualization
         if init_renderer:
+            from ..utils.skeleton_renderer import SkeletonRenderer
+            from ..utils.mesh_renderer import MeshRenderer
+
             self.renderer = SkeletonRenderer(self.cfg)
             #self.mesh_renderer = MeshRenderer(self.cfg, faces=self.mano.faces)
             try:
@@ -130,6 +139,12 @@ class HAMER(pl.LightningModule):
         pred_mano_params['global_orient'] = pred_mano_params['global_orient'].reshape(batch_size, -1, 3, 3)
         pred_mano_params['hand_pose'] = pred_mano_params['hand_pose'].reshape(batch_size, -1, 3, 3)
         pred_mano_params['betas'] = pred_mano_params['betas'].reshape(batch_size, -1)
+        if self.mano is None:
+            output['pred_keypoints_3d'] = torch.zeros(batch_size, 0, 3, device=device, dtype=dtype)
+            output['pred_vertices'] = torch.zeros(batch_size, 0, 3, device=device, dtype=dtype)
+            output['pred_keypoints_2d'] = torch.zeros(batch_size, 0, 2, device=device, dtype=dtype)
+            return output
+
         mano_output = self.mano(**{k: v.float() for k,v in pred_mano_params.items()}, pose2rot=False)
         pred_keypoints_3d = mano_output.joints
         pred_vertices = mano_output.vertices
