@@ -26,7 +26,7 @@ def download_models(folder=CACHE_DIR_HAMER):
             # if ends with tar.gz, tar -xzf
             if file_name.endswith(".tar.gz"):
                 print("Extracting file: " + file_name)
-                os.system("tar -xvf " + output_path)
+                os.system("tar --no-same-owner --warning=no-unknown-keyword -xvf " + output_path)
 
 DEFAULT_CHECKPOINT=f'{CACHE_DIR_HAMER}/hamer_ckpts/checkpoints/hamer.ckpt'
 def load_hamer(checkpoint_path=DEFAULT_CHECKPOINT):
@@ -48,5 +48,5 @@ def load_hamer(checkpoint_path=DEFAULT_CHECKPOINT):
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
         model_cfg.freeze()
 
-    model = HAMER.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg)
+    model = HAMER.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg, init_renderer=False)
     return model, model_cfg
