@@ -26,6 +26,17 @@ class GVHMRRun:
     video_path: Path
 
 
+@dataclass
+class PersonTrackCandidate:
+    choice: int
+    track_id: int
+    frame_count: int
+    area_score: float
+    avg_area: float
+    best_frame: int
+    best_box: list[float]
+
+
 @contextlib.contextmanager
 def temporary_argv(argv: list[str]):
     old_argv = sys.argv[:]
@@ -101,6 +112,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-cam", action="store_true", help="Tell GVHMR the camera is static.")
     parser.add_argument("--use-dpvo", action="store_true", help="Use DPVO instead of GVHMR SimpleVO.")
     parser.add_argument("--f-mm", type=int, default=None, help="Full-frame focal length in mm for GVHMR.")
+    parser.add_argument(
+        "--auto-person",
+        action="store_true",
+        help="Use the largest detected person track without showing the selection prompt.",
+    )
+    parser.add_argument(
+        "--person-select-ui",
+        choices=("auto", "window", "terminal"),
+        default="auto",
+        help="How to ask for the target person when multiple tracks are found.",
+    )
+    parser.add_argument("--person-track-id", type=int, default=None, help="Use a specific YOLO person track id.")
     parser.add_argument("--verbose", action="store_true", help="Save GVHMR preprocessing overlays.")
     parser.add_argument(
         "--render-preview",
@@ -171,6 +194,366 @@ def set_cfg_path(cfg: Any, dotted_key: str, value: str) -> None:
             setattr(target, parts[-1], value)
 
 
+def unlink_if_exists(path: str | Path) -> None:
+    path = Path(path)
+    if path.exists() and path.is_file():
+        path.unlink()
+
+
+def clear_gvhmr_person_cache(paths: Any) -> None:
+    for key in ("bbx", "vitpose", "vit_features"):
+        value = getattr(paths, key, None)
+        if value is not None:
+            unlink_if_exists(value)
+
+
+def build_person_track_candidates(
+    id_to_frame_ids: dict[int, list[int]],
+    id_to_bbx_xyxys: dict[int, Any],
+    id_sorted: list[int],
+    width: int,
+    height: int,
+) -> list[PersonTrackCandidate]:
+    import numpy as np
+
+    candidates: list[PersonTrackCandidate] = []
+    image_area = max(float(width * height), 1.0)
+    for choice, track_id in enumerate(id_sorted, start=1):
+        boxes = np.asarray(id_to_bbx_xyxys[track_id], dtype=np.float32)
+        frame_ids = list(id_to_frame_ids[track_id])
+        wh = np.clip(boxes[:, 2:] - boxes[:, :2], a_min=0.0, a_max=None)
+        areas = wh[:, 0] * wh[:, 1]
+        best_index = int(np.argmax(areas))
+        area_score = float(areas.sum() / image_area)
+        avg_area = float((areas / image_area).mean())
+        candidates.append(
+            PersonTrackCandidate(
+                choice=choice,
+                track_id=int(track_id),
+                frame_count=len(frame_ids),
+                area_score=area_score,
+                avg_area=avg_area,
+                best_frame=int(frame_ids[best_index]),
+                best_box=[float(v) for v in boxes[best_index].tolist()],
+            )
+        )
+    return candidates
+
+
+def read_video_frame_cv2(video_path: str | Path, frame_idx: int) -> Any:
+    import cv2
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ok, frame = capture.read()
+    capture.release()
+    if not ok or frame is None:
+        raise RuntimeError(f"Could not read frame {frame_idx} from {video_path}")
+    return frame
+
+
+def resize_square_letterbox(img: Any, size: int) -> Any:
+    import cv2
+    import numpy as np
+
+    height, width = img.shape[:2]
+    scale = min(size / max(width, 1), size / max(height, 1))
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    resized = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    canvas = np.full((size, size, 3), 242, dtype=np.uint8)
+    x0 = (size - new_width) // 2
+    y0 = (size - new_height) // 2
+    canvas[y0 : y0 + new_height, x0 : x0 + new_width] = resized
+    return canvas
+
+
+def crop_person_thumbnail(frame: Any, box: list[float], size: int = 220) -> Any:
+    import cv2
+
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = box
+    bw = max(x2 - x1, 1.0)
+    bh = max(y2 - y1, 1.0)
+    pad = 0.18 * max(bw, bh)
+    px1 = max(0, int(round(x1 - pad)))
+    py1 = max(0, int(round(y1 - pad)))
+    px2 = min(width, int(round(x2 + pad)))
+    py2 = min(height, int(round(y2 + pad)))
+    crop = frame[py1:py2, px1:px2].copy()
+    if crop.size == 0:
+        crop = frame.copy()
+        px1 = py1 = 0
+    rx1 = max(0, int(round(x1 - px1)))
+    ry1 = max(0, int(round(y1 - py1)))
+    rx2 = min(crop.shape[1] - 1, int(round(x2 - px1)))
+    ry2 = min(crop.shape[0] - 1, int(round(y2 - py1)))
+    cv2.rectangle(crop, (rx1, ry1), (rx2, ry2), (0, 210, 255), 3)
+    return resize_square_letterbox(crop, size)
+
+
+def write_person_selection_thumbnail(
+    video_path: str | Path,
+    candidates: list[PersonTrackCandidate],
+    output_path: Path,
+) -> Path:
+    import cv2
+    import numpy as np
+
+    if not candidates:
+        raise RuntimeError("No person candidates to draw.")
+
+    cell_width = 270
+    cell_height = 300
+    thumb_size = 220
+    cols = min(3, len(candidates))
+    rows = (len(candidates) + cols - 1) // cols
+    sheet = np.full((rows * cell_height, cols * cell_width, 3), 255, dtype=np.uint8)
+
+    for index, candidate in enumerate(candidates):
+        row = index // cols
+        col = index % cols
+        x0 = col * cell_width
+        y0 = row * cell_height
+        frame = read_video_frame_cv2(video_path, candidate.best_frame)
+        thumb = crop_person_thumbnail(frame, candidate.best_box, thumb_size)
+        sheet[y0 + 56 : y0 + 56 + thumb_size, x0 + 25 : x0 + 25 + thumb_size] = thumb
+        cv2.putText(
+            sheet,
+            f"{candidate.choice}",
+            (x0 + 22, y0 + 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.05,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            sheet,
+            f"track {candidate.track_id}  frames {candidate.frame_count}",
+            (x0 + 68, y0 + 31),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (55, 55, 55),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            sheet,
+            f"frame {candidate.best_frame}",
+            (x0 + 68, y0 + 49),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (95, 95, 95),
+            1,
+            cv2.LINE_AA,
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), sheet)
+    return output_path
+
+
+def opencv_selection_window_available() -> bool:
+    if os.environ.get("CAP_DISABLE_OPENCV_WINDOW", "").lower() in {"1", "true", "yes"}:
+        return False
+    if os.name == "nt" or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def select_person_candidate_with_opencv_window(
+    candidates: list[PersonTrackCandidate],
+    thumbnail_path: Path,
+    selection_ui: str,
+) -> PersonTrackCandidate | None:
+    if selection_ui == "terminal":
+        return None
+    if not opencv_selection_window_available():
+        if selection_ui == "window":
+            print("[CAP] OpenCV person selection window needs a GUI display. Falling back to terminal input.")
+        return None
+    if len(candidates) > 9:
+        print("[CAP] OpenCV person selection supports up to 9 candidates. Falling back to terminal input.")
+        return None
+
+    try:
+        import cv2
+        import numpy as np
+
+        sheet = cv2.imread(str(thumbnail_path))
+        if sheet is None:
+            return None
+
+        banner_height = 48
+        canvas = np.full((sheet.shape[0] + banner_height, sheet.shape[1], 3), 245, dtype=np.uint8)
+        canvas[banner_height:] = sheet
+        cv2.putText(
+            canvas,
+            "Press a number key to select target person. Enter = 1, Esc/Q = terminal.",
+            (18, 31),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (20, 20, 20),
+            1,
+            cv2.LINE_AA,
+        )
+
+        window_name = "CAP - Select Target Person"
+        valid_keys = {ord(str(candidate.choice)): candidate for candidate in candidates}
+
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.imshow(window_name, canvas)
+        cv2.resizeWindow(window_name, min(canvas.shape[1], 1200), min(canvas.shape[0], 900))
+
+        while True:
+            try:
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    return None
+            except cv2.error:
+                return None
+
+            key = cv2.waitKey(100)
+            if key < 0:
+                continue
+            key = key & 0xFF
+            if key in valid_keys:
+                return valid_keys[key]
+            if key in (10, 13):
+                return candidates[0]
+            if key in (27, ord("q"), ord("Q")):
+                return None
+    except Exception as exc:
+        print(f"[CAP] OpenCV person selection window unavailable ({exc}). Falling back to terminal input.")
+        return None
+    finally:
+        try:
+            cv2.destroyWindow("CAP - Select Target Person")
+        except Exception:
+            pass
+
+
+def select_person_candidate(
+    candidates: list[PersonTrackCandidate],
+    thumbnail_path: Path,
+    auto_person: bool,
+    person_track_id: int | None,
+    no_interactive: bool,
+    selection_ui: str,
+) -> PersonTrackCandidate:
+    if not candidates:
+        raise RuntimeError("No person track candidates were found.")
+
+    if person_track_id is not None:
+        for candidate in candidates:
+            if candidate.track_id == person_track_id:
+                return candidate
+        available = ", ".join(str(candidate.track_id) for candidate in candidates)
+        raise ValueError(f"Track id {person_track_id} was not found. Available track ids: {available}")
+
+    if len(candidates) == 1:
+        print(f"[CAP] One person track detected. Using track {candidates[0].track_id}.")
+        return candidates[0]
+
+    print(f"[CAP] Person selection thumbnail: {thumbnail_path}")
+    for candidate in candidates:
+        print(
+            "[CAP] "
+            f"{candidate.choice}: track {candidate.track_id}, "
+            f"frames={candidate.frame_count}, avg_area={candidate.avg_area:.4f}"
+        )
+
+    if auto_person or no_interactive:
+        selected = candidates[0]
+        print(f"[CAP] Auto-selected person {selected.choice} (track {selected.track_id}).")
+        return selected
+
+    selected = select_person_candidate_with_opencv_window(candidates, thumbnail_path, selection_ui)
+    if selected is not None:
+        print(f"[CAP] OpenCV-selected person {selected.choice} (track {selected.track_id}).")
+        return selected
+
+    if not sys.stdin.isatty():
+        selected = candidates[0]
+        print(f"[CAP] Auto-selected person {selected.choice} (track {selected.track_id}).")
+        return selected
+
+    choices = {candidate.choice: candidate for candidate in candidates}
+    while True:
+        raw = input("Select target person number [1]: ").strip()
+        if raw == "":
+            return candidates[0]
+        try:
+            choice = int(raw)
+        except ValueError:
+            print("Please type the number shown on the thumbnail.")
+            continue
+        if choice in choices:
+            return choices[choice]
+        print(f"Please choose one of: {', '.join(str(c.choice) for c in candidates)}")
+
+
+def prepare_selected_person_track(
+    cfg: Any,
+    force: bool,
+    auto_person: bool,
+    person_track_id: int | None,
+    no_interactive: bool,
+    selection_ui: str,
+) -> None:
+    import torch
+
+    from hmr4d.utils.geo.hmr_cam import get_bbx_xys_from_xyxy
+    from hmr4d.utils.preproc import Tracker
+    from hmr4d.utils.video_io_utils import get_video_lwh
+
+    paths = cfg.paths
+    bbx_path = Path(paths.bbx)
+    if bbx_path.exists() and not force:
+        if person_track_id is not None:
+            print("[CAP] Existing person bbox cache found. Use --force to change the selected person.")
+        return
+
+    tracker = Tracker()
+    track_history = tracker.track(cfg.video_path)
+    id_to_frame_ids, id_to_bbx_xyxys, id_sorted = tracker.sort_track_length(track_history, cfg.video_path)
+    if not id_sorted:
+        raise RuntimeError(f"No person tracks found in video: {cfg.video_path}")
+
+    _, width, height = get_video_lwh(cfg.video_path)
+    candidates = build_person_track_candidates(id_to_frame_ids, id_to_bbx_xyxys, id_sorted, width, height)
+    thumbnail_path = Path(cfg.output_dir) / "person_selection.jpg"
+    write_person_selection_thumbnail(cfg.video_path, candidates, thumbnail_path)
+    selected = select_person_candidate(
+        candidates,
+        thumbnail_path,
+        auto_person,
+        person_track_id,
+        no_interactive,
+        selection_ui,
+    )
+
+    bbx_xyxy = tracker.build_one_track(
+        cfg.video_path,
+        id_to_frame_ids[selected.track_id],
+        id_to_bbx_xyxys[selected.track_id],
+    ).float()
+    bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()
+    torch.save(
+        {
+            "bbx_xyxy": bbx_xyxy,
+            "bbx_xys": bbx_xys,
+            "selected_track_id": selected.track_id,
+            "person_candidates": [candidate.__dict__ for candidate in candidates],
+            "person_selection_thumbnail": str(thumbnail_path),
+        },
+        bbx_path,
+    )
+    print(f"[CAP] Selected person {selected.choice} (track {selected.track_id}) for GVHMR input.")
+
+
 def run_gvhmr(
     video: Path,
     output_root: Path,
@@ -180,6 +563,10 @@ def run_gvhmr(
     verbose: bool,
     render: bool,
     force: bool,
+    auto_person: bool,
+    person_track_id: int | None,
+    no_interactive: bool,
+    selection_ui: str,
 ) -> GVHMRRun:
     ensure_project_on_path()
     from tools.demo import demo as gvhmr_demo
@@ -205,8 +592,18 @@ def run_gvhmr(
 
     paths = cfg.paths
     hmr4d_results = Path(paths.hmr4d_results)
-    if force and hmr4d_results.exists():
-        hmr4d_results.unlink()
+    if force:
+        unlink_if_exists(hmr4d_results)
+        clear_gvhmr_person_cache(paths)
+
+    prepare_selected_person_track(
+        cfg,
+        force=force,
+        auto_person=auto_person,
+        person_track_id=person_track_id,
+        no_interactive=no_interactive,
+        selection_ui=selection_ui,
+    )
 
     gvhmr_demo.Log.info("[CAP] Running GVHMR preprocess")
     try:
@@ -619,6 +1016,10 @@ def main() -> None:
         verbose=args.verbose,
         render=not args.skip_gvhmr_render,
         force=args.force,
+        auto_person=args.auto_person,
+        person_track_id=args.person_track_id,
+        no_interactive=args.no_interactive,
+        selection_ui=args.person_select_ui,
     )
 
     frame_dir = gvhmr_run.output_dir / "hamer_frames"
